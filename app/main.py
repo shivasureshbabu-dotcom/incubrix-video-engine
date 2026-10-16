@@ -1,0 +1,394 @@
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+import tempfile
+import uuid
+import wave
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File
+from app.audio_analyzer import (
+    analyze_audio,
+    detect_emphasis,
+    create_scene_timing,
+)
+import shutil
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
+
+APP_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = Path(os.getenv("DATA_DIR", APP_ROOT / "data"))
+JOBS_DIR = DATA_DIR / "jobs"
+OUTPUTS_DIR = DATA_DIR / "outputs"
+UPLOADS_DIR = DATA_DIR / "uploads"
+for directory in (JOBS_DIR, OUTPUTS_DIR, UPLOADS_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(
+    title="IncuBrix Script-to-B-Roll Engine",
+    version="0.1.0",
+    description="Stage 1 backend foundation. Audio analysis, footage ranking, and rendering come in later stages.",
+)
+
+_idempotency_lock = threading.Lock()
+_idempotency: dict[str, str] = {}
+
+
+class CreateJobRequest(BaseModel):
+    script: str = Field(min_length=10, max_length=12000)
+    aspect_ratio: str = "16:9"
+    style: str = Field(default="documentary", max_length=80)
+
+    @field_validator("script")
+    @classmethod
+    def script_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("script must not be blank")
+        return value.strip()
+
+    @field_validator("aspect_ratio")
+    @classmethod
+    def valid_aspect_ratio(cls, value: str) -> str:
+        if value not in {"16:9", "9:16", "1:1"}:
+            raise ValueError("aspect_ratio must be 16:9, 9:16, or 1:1")
+        return value
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def job_path(job_id: str) -> Path:
+    return JOBS_DIR / f"{job_id}.json"
+
+
+def read_job(job_id: str) -> dict[str, Any] | None:
+    path = job_path(job_id)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_job(job: dict[str, Any]) -> None:
+    path = job_path(job["job_id"])
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(job, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def run_demo_job(job_id: str) -> None:
+    """Temporary Stage 1 worker; later stages replace this with real processing."""
+    steps = [
+        (10, "accepted", "Job accepted"),
+        (35, "planning", "Preparing scene plan (placeholder)"),
+        (70, "processing", "Audio analysis and footage selection will be added next"),
+        (100, "completed", "Stage 1 demo job completed; no video rendered yet"),
+    ]
+    for progress, status, message in steps:
+        time.sleep(0.5)
+        job = read_job(job_id)
+        if job is None:
+            return
+        job.update(progress=progress, status=status, message=message, updated_at=now_iso())
+        write_job(job)
+
+
+@app.get("/")
+def root():
+    return {"name": "IncuBrix Script-to-B-Roll Engine", "version": "0.1.0", "stage": 1, "docs": "/docs"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "timestamp": now_iso()}
+
+
+@app.get("/ready")
+def ready():
+    checks = {
+        "job_storage": JOBS_DIR.exists() and JOBS_DIR.is_dir(),
+        "output_storage": OUTPUTS_DIR.exists() and OUTPUTS_DIR.is_dir(),
+    }
+    return JSONResponse(status_code=200 if all(checks.values()) else 503,
+                        content={"ready": all(checks.values()), "checks": checks})
+
+
+@app.post("/api/v1/jobs", status_code=202)
+def create_job(
+    payload: CreateJobRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    if idempotency_key:
+        if len(idempotency_key) > 200:
+            raise HTTPException(status_code=400, detail={
+                "code": "INVALID_IDEMPOTENCY_KEY",
+                "message": "Idempotency-Key must be 200 characters or fewer.",
+            })
+        with _idempotency_lock:
+            old_id = _idempotency.get(idempotency_key)
+            old_job = read_job(old_id) if old_id else None
+            if old_job:
+                return {"job": old_job, "idempotent_replay": True}
+
+    job_id = str(uuid.uuid4())
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "progress": 0,
+        "message": "Job queued. Stage 1 runs a placeholder workflow only.",
+        "input": payload.model_dump(),
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "result": None,
+        "error": None,
+    }
+    write_job(job)
+    if idempotency_key:
+        with _idempotency_lock:
+            _idempotency[idempotency_key] = job_id
+    threading.Thread(target=run_demo_job, args=(job_id,), daemon=True).start()
+    return {"job": job, "idempotent_replay": False}
+
+
+@app.get("/api/v1/jobs/{job_id}")
+def get_job(job_id: str):
+    job = read_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail={
+            "code": "JOB_NOT_FOUND", "message": f"No job found with id {job_id}."
+        })
+    return {"job": job}
+
+
+@app.get("/api/v1/jobs")
+def list_jobs(limit: int = 20):
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=400, detail={
+            "code": "INVALID_LIMIT", "message": "limit must be between 1 and 100."
+        })
+    jobs = []
+    for path in JOBS_DIR.glob("*.json"):
+        try:
+            jobs.append(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+    jobs.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+    return {"jobs": jobs[:limit], "count": min(len(jobs), limit)}
+
+
+@app.get("/api/v1/capabilities")
+def capabilities():
+    return {
+        "stage": 1,
+        "implemented": [
+            "script input validation", "background demo jobs", "job status and progress",
+            "Idempotency-Key support", "health and readiness endpoints", "persistent JSON job records"
+        ],
+        "planned": [
+            "voiceover upload and transcription", "silence and emphasis detection",
+            "semantic footage retrieval", "Footage Diversity Guard", "caption and scene timing",
+            "FFmpeg rendering", "licensing manifest and output validation"
+        ],
+    }
+
+@app.post("/api/v1/audio/analyze")
+def analyze_uploaded_audio(file: UploadFile = File(...)):
+    if not file.filename or Path(file.filename).suffix.lower() != ".wav":
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_AUDIO_FORMAT",
+                "message": "Please upload a WAV audio file."
+            },
+        )
+
+    # Limit uploads to 50 MB.
+    upload_path = UPLOADS_DIR / f"{uuid.uuid4()}.wav"
+
+    try:
+        size = 0
+        max_size = 50 * 1024 * 1024
+
+        with upload_path.open("wb") as destination:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+
+                size += len(chunk)
+                if size > max_size:
+                    raise HTTPException(
+                        status_code=413,
+                        detail={
+                            "code": "AUDIO_TOO_LARGE",
+                            "message": "Audio file must be 50 MB or smaller."
+                        },
+                    )
+
+                destination.write(chunk)
+
+        result = analyze_audio(str(upload_path))
+        return {"status": "success", "analysis": result}
+
+    except (ValueError, wave.Error) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_AUDIO_FILE",
+                "message": str(exc)
+            },
+        ) from exc
+
+    finally:
+        upload_path.unlink(missing_ok=True)
+        file.file.close()
+
+
+
+
+@app.post("/api/v1/audio/emphasis")
+def analyze_audio_emphasis(file: UploadFile = File(...)):
+    if not file.filename or Path(file.filename).suffix.lower() != ".wav":
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload a WAV audio file."
+        )
+
+    upload_path = UPLOADS_DIR / f"{uuid.uuid4()}.wav"
+
+    try:
+        size = 0
+        max_size = 50 * 1024 * 1024
+
+        with upload_path.open("wb") as destination:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+
+                size += len(chunk)
+                if size > max_size:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="File is too large. Maximum size is 50 MB."
+                    )
+
+                destination.write(chunk)
+
+        result = detect_emphasis(str(upload_path))
+
+        return {
+            "status": "success",
+            "analysis": result
+        }
+
+    except (ValueError, wave.Error) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc)
+        ) from exc
+
+    finally:
+        upload_path.unlink(missing_ok=True)
+        file.file.close()
+
+
+
+
+
+from pydantic import BaseModel, Field
+
+
+class SceneTimingRequest(BaseModel):
+    duration_seconds: float = Field(gt=0)
+    silence_intervals: list[dict] = []
+    emphasis_intervals: list[dict] = []
+
+
+@app.post("/api/v1/audio/scenes")
+def create_audio_scenes(request: SceneTimingRequest):
+    try:
+        result = create_scene_timing(
+            duration_seconds=request.duration_seconds,
+            silence_intervals=request.silence_intervals,
+            emphasis_intervals=request.emphasis_intervals,
+        )
+        return {
+            "status": "success",
+            "analysis": result,
+        }
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+
+
+@app.post("/api/v1/audio/analyze-and-scenes")
+async def analyze_audio_and_create_scenes(
+    file: UploadFile = File(...),
+):
+    """Analyze WAV audio and automatically create scene timings."""
+
+    if not file.filename or not file.filename.lower().endswith(".wav"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only WAV files are supported.",
+        )
+
+    contents = await file.read()
+
+    if len(contents) > 50 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="File exceeds the 50 MB limit.",
+        )
+
+    if not contents:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is empty.",
+        )
+
+    saved_path = None
+
+    try:
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".wav",
+            dir=UPLOADS_DIR,
+            delete=False,
+        ) as temp_file:
+            temp_file.write(contents)
+            saved_path = Path(temp_file.name)
+
+        audio_analysis = analyze_audio(str(saved_path))
+        emphasis_analysis = detect_emphasis(str(saved_path))
+
+        scene_analysis = create_scene_timing(
+            duration_seconds=audio_analysis["duration_seconds"],
+            silence_intervals=audio_analysis["silence_intervals"],
+            emphasis_intervals=emphasis_analysis["emphasis_intervals"],
+        )
+
+        return {
+            "status": "success",
+            "audio_analysis": audio_analysis,
+            "emphasis_analysis": emphasis_analysis,
+            "scene_analysis": scene_analysis,
+        }
+
+    except (ValueError, wave.Error) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+    finally:
+        if saved_path is not None:
+            saved_path.unlink(missing_ok=True)
