@@ -1,16 +1,18 @@
-﻿from __future__ import annotations
-from fastapi.responses import FileResponse
+
+from __future__ import annotations
+
+from fastapi.responses import FileResponse, JSONResponse
 from app.video_pipeline import run_video_pipeline
 import json
 import os
 import threading
-import time
 import tempfile
 import uuid
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Header, HTTPException, UploadFile, File
 from app.audio_analyzer import (
@@ -18,8 +20,6 @@ from app.audio_analyzer import (
     detect_emphasis,
     create_scene_timing,
 )
-import shutil
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 APP_ROOT = Path(__file__).resolve().parent.parent
@@ -27,14 +27,20 @@ DATA_DIR = Path(os.getenv("DATA_DIR", APP_ROOT / "data"))
 JOBS_DIR = DATA_DIR / "jobs"
 OUTPUTS_DIR = DATA_DIR / "outputs"
 UPLOADS_DIR = DATA_DIR / "uploads"
+
 for directory in (JOBS_DIR, OUTPUTS_DIR, UPLOADS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(
     title="IncuBrix Script-to-B-Roll Engine",
     version="0.1.0",
-    description="Stage 1 backend foundation. Audio analysis, footage ranking, and rendering come in later stages.",
+    description=(
+        "Stage 1 backend foundation. Audio analysis, footage ranking, "
+        "and rendering come in later stages."
+    ),
 )
+
+# CORS configuration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -42,6 +48,7 @@ app.add_middleware(
         "http://localhost:5173",
         "https://incubrix-video-engine.vercel.app",
     ],
+    allow_origin_regex=r"https://[a-zA-Z0-9-]+\.vercel\.app",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -94,7 +101,7 @@ def write_job(job: dict[str, Any]) -> None:
 
 
 def run_demo_job(job_id: str) -> None:
-    """Run real video generation and only complete when an MP4 exists."""
+    """Run video generation and complete only when a valid MP4 exists."""
     job = read_job(job_id)
     if job is None:
         return
@@ -134,18 +141,20 @@ def run_demo_job(job_id: str) -> None:
         video_path = Path(result["video_path"]).resolve()
         output_root = OUTPUTS_DIR.resolve()
 
-        # Never mark the job completed unless the final MP4 exists
-        # inside the configured outputs directory.
         if (
             not video_path.is_relative_to(output_root)
             or video_path.suffix.lower() != ".mp4"
             or not video_path.is_file()
             or video_path.stat().st_size == 0
         ):
-            raise RuntimeError("Video generation did not produce a valid MP4")
+            raise RuntimeError(
+                "Video generation did not produce a valid MP4"
+            )
+
         validation = result.get("validation")
         if not isinstance(validation, dict) or validation.get("valid") is not True:
             raise RuntimeError("Generated video failed validation")
+
         job = read_job(job_id)
         if job is None:
             return
@@ -180,8 +189,15 @@ def run_demo_job(job_id: str) -> None:
         )
         write_job(job)
 
+
+@app.get("/")
 def root():
-    return {"name": "IncuBrix Script-to-B-Roll Engine", "version": "0.1.0", "stage": 1, "docs": "/docs"}
+    return {
+        "name": "IncuBrix Script-to-B-Roll Engine",
+        "version": "0.1.0",
+        "stage": 1,
+        "docs": "/docs",
+    }
 
 
 @app.get("/health")
@@ -195,16 +211,19 @@ def ready():
         "job_storage": JOBS_DIR.exists() and JOBS_DIR.is_dir(),
         "output_storage": OUTPUTS_DIR.exists() and OUTPUTS_DIR.is_dir(),
     }
-    return JSONResponse(status_code=200 if all(checks.values()) else 503,
-                        content={"ready": all(checks.values()), "checks": checks})
+    return JSONResponse(
+        status_code=200 if all(checks.values()) else 503,
+        content={"ready": all(checks.values()), "checks": checks},
+    )
 
-
-@app.post("/api/v1/jobs", status_code=202)
 
 @app.post("/api/v1/jobs", status_code=202)
 def create_job(
     payload: CreateJobRequest,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(
+        default=None,
+        alias="Idempotency-Key",
+    ),
 ):
     if idempotency_key is not None:
         if not idempotency_key.strip() or len(idempotency_key) > 200:
@@ -212,13 +231,13 @@ def create_job(
                 status_code=400,
                 detail={
                     "code": "INVALID_IDEMPOTENCY_KEY",
-                    "message": "Idempotency-Key must be non-empty and 200 characters or fewer.",
+                    "message": (
+                        "Idempotency-Key must be non-empty and "
+                        "200 characters or fewer."
+                    ),
                 },
             )
 
-    job = None
-
-    # Keep lookup, job creation, and key registration atomic.
     with _idempotency_lock:
         if idempotency_key is not None:
             old_id = _idempotency.get(idempotency_key)
@@ -245,7 +264,6 @@ def create_job(
         if idempotency_key is not None:
             _idempotency[idempotency_key] = job_id
 
-    # Start generation outside the lock.
     threading.Thread(
         target=run_demo_job,
         args=(job["job_id"],),
@@ -255,15 +273,19 @@ def create_job(
     return {"job": job, "idempotent_replay": False}
 
 
-
 @app.get("/api/v1/jobs/{job_id}")
 def get_job(job_id: str):
     job = read_job(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail={
-            "code": "JOB_NOT_FOUND", "message": f"No job found with id {job_id}."
-        })
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "JOB_NOT_FOUND",
+                "message": f"No job found with id {job_id}.",
+            },
+        )
     return {"job": job}
+
 
 @app.get("/api/v1/jobs/{job_id}/video")
 def download_generated_video(job_id: str):
@@ -288,7 +310,10 @@ def download_generated_video(job_id: str):
     if not filename or Path(filename).name != filename:
         raise HTTPException(
             status_code=404,
-            detail={"code": "VIDEO_NOT_FOUND", "message": "Video not found."},
+            detail={
+                "code": "VIDEO_NOT_FOUND",
+                "message": "Video not found.",
+            },
         )
 
     output_root = OUTPUTS_DIR.resolve()
@@ -301,7 +326,10 @@ def download_generated_video(job_id: str):
     ):
         raise HTTPException(
             status_code=404,
-            detail={"code": "VIDEO_NOT_FOUND", "message": "Video file not found."},
+            detail={
+                "code": "VIDEO_NOT_FOUND",
+                "message": "Video file not found.",
+            },
         )
 
     return FileResponse(
@@ -314,16 +342,25 @@ def download_generated_video(job_id: str):
 @app.get("/api/v1/jobs")
 def list_jobs(limit: int = 20):
     if limit < 1 or limit > 100:
-        raise HTTPException(status_code=400, detail={
-            "code": "INVALID_LIMIT", "message": "limit must be between 1 and 100."
-        })
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_LIMIT",
+                "message": "limit must be between 1 and 100.",
+            },
+        )
+
     jobs = []
     for path in JOBS_DIR.glob("*.json"):
         try:
             jobs.append(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
             continue
-    jobs.sort(key=lambda item: item.get("created_at", ""), reverse=True)
+
+    jobs.sort(
+        key=lambda item: item.get("created_at", ""),
+        reverse=True,
+    )
     return {"jobs": jobs[:limit], "count": min(len(jobs), limit)}
 
 
@@ -332,15 +369,24 @@ def capabilities():
     return {
         "stage": 1,
         "implemented": [
-            "script input validation", "background demo jobs", "job status and progress",
-            "Idempotency-Key support", "health and readiness endpoints", "persistent JSON job records"
+            "script input validation",
+            "background demo jobs",
+            "job status and progress",
+            "Idempotency-Key support",
+            "health and readiness endpoints",
+            "persistent JSON job records",
         ],
         "planned": [
-            "voiceover upload and transcription", "silence and emphasis detection",
-            "semantic footage retrieval", "Footage Diversity Guard", "caption and scene timing",
-            "FFmpeg rendering", "licensing manifest and output validation"
+            "voiceover upload and transcription",
+            "silence and emphasis detection",
+            "semantic footage retrieval",
+            "Footage Diversity Guard",
+            "caption and scene timing",
+            "FFmpeg rendering",
+            "licensing manifest and output validation",
         ],
     }
+
 
 @app.post("/api/v1/audio/analyze")
 def analyze_uploaded_audio(file: UploadFile = File(...)):
@@ -349,11 +395,10 @@ def analyze_uploaded_audio(file: UploadFile = File(...)):
             status_code=400,
             detail={
                 "code": "INVALID_AUDIO_FORMAT",
-                "message": "Please upload a WAV audio file."
+                "message": "Please upload a WAV audio file.",
             },
         )
 
-    # Limit uploads to 50 MB.
     upload_path = UPLOADS_DIR / f"{uuid.uuid4()}.wav"
 
     try:
@@ -372,7 +417,7 @@ def analyze_uploaded_audio(file: UploadFile = File(...)):
                         status_code=413,
                         detail={
                             "code": "AUDIO_TOO_LARGE",
-                            "message": "Audio file must be 50 MB or smaller."
+                            "message": "Audio file must be 50 MB or smaller.",
                         },
                     )
 
@@ -386,7 +431,7 @@ def analyze_uploaded_audio(file: UploadFile = File(...)):
             status_code=400,
             detail={
                 "code": "INVALID_AUDIO_FILE",
-                "message": str(exc)
+                "message": str(exc),
             },
         ) from exc
 
@@ -395,14 +440,12 @@ def analyze_uploaded_audio(file: UploadFile = File(...)):
         file.file.close()
 
 
-
-
 @app.post("/api/v1/audio/emphasis")
 def analyze_audio_emphasis(file: UploadFile = File(...)):
     if not file.filename or Path(file.filename).suffix.lower() != ".wav":
         raise HTTPException(
             status_code=400,
-            detail="Please upload a WAV audio file."
+            detail="Please upload a WAV audio file.",
         )
 
     upload_path = UPLOADS_DIR / f"{uuid.uuid4()}.wav"
@@ -418,25 +461,21 @@ def analyze_audio_emphasis(file: UploadFile = File(...)):
                     break
 
                 size += len(chunk)
-                if size > max_size:
+                if size > 50 * 1024 * 1024:
                     raise HTTPException(
                         status_code=413,
-                        detail="File is too large. Maximum size is 50 MB."
+                        detail="File is too large. Maximum size is 50 MB.",
                     )
 
                 destination.write(chunk)
 
         result = detect_emphasis(str(upload_path))
-
-        return {
-            "status": "success",
-            "analysis": result
-        }
+        return {"status": "success", "analysis": result}
 
     except (ValueError, wave.Error) as exc:
         raise HTTPException(
             status_code=400,
-            detail=str(exc)
+            detail=str(exc),
         ) from exc
 
     finally:
@@ -444,16 +483,10 @@ def analyze_audio_emphasis(file: UploadFile = File(...)):
         file.file.close()
 
 
-
-
-
-from pydantic import BaseModel, Field
-
-
 class SceneTimingRequest(BaseModel):
     duration_seconds: float = Field(gt=0)
-    silence_intervals: list[dict] = []
-    emphasis_intervals: list[dict] = []
+    silence_intervals: list[dict] = Field(default_factory=list)
+    emphasis_intervals: list[dict] = Field(default_factory=list)
 
 
 @app.post("/api/v1/audio/scenes")
@@ -464,20 +497,14 @@ def create_audio_scenes(request: SceneTimingRequest):
             silence_intervals=request.silence_intervals,
             emphasis_intervals=request.emphasis_intervals,
         )
-        return {
-            "status": "success",
-            "analysis": result,
-        }
+        return {"status": "success", "analysis": result}
+
     except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-
-
 @app.post("/api/v1/audio/analyze-and-scenes")
-async def analyze_audio_and_create_scenes(
-    file: UploadFile = File(...),
-):
+async def analyze_audio_and_create_scenes(file: UploadFile = File(...)):
     """Analyze WAV audio and automatically create scene timings."""
 
     if not file.filename or not file.filename.lower().endswith(".wav"):
@@ -538,5 +565,3 @@ async def analyze_audio_and_create_scenes(
     finally:
         if saved_path is not None:
             saved_path.unlink(missing_ok=True)
-
-
