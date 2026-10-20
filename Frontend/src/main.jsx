@@ -1,4 +1,4 @@
-
+﻿
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import "./styles.css";
 
-const API = "";
+const API = "https://incubrix-video-engine-qc6b.onrender.com";
 
 const formats = [
   { id: "landscape", label: "Landscape", ratio: "16:9", icon: Monitor },
@@ -76,7 +76,7 @@ function readableError(detail, status) {
     return detail
       .map((item) => {
         const location = Array.isArray(item.loc)
-          ? item.loc.join(" → ")
+          ? item.loc.join(" â†’ ")
           : "";
         return `${location ? `${location}: ` : ""}${item.msg || JSON.stringify(item)}`;
       })
@@ -348,7 +348,7 @@ function App() {
     const end = interval.end_seconds ?? interval.end ?? interval.end_time;
 
     if (start !== undefined && end !== undefined) {
-      return `${Number(start).toFixed(2)}s – ${Number(end).toFixed(2)}s`;
+      return `${Number(start).toFixed(2)}s â€“ ${Number(end).toFixed(2)}s`;
     }
 
     return JSON.stringify(interval);
@@ -459,7 +459,7 @@ function App() {
                   <label htmlFor="script">Your script</label>
                   <span className="field-hint">
                     {script.trim() ? script.trim().split(/\s+/).length : 0}{" "}
-                    words · {script.length} characters
+                    words Â· {script.length} characters
                   </span>
                 </div>
 
@@ -557,7 +557,7 @@ function App() {
                     <Play size={17} fill="currentColor" />
                   )}
                   {busy ? "Creating your video..." : "Generate video"}
-                  {!busy && <span className="button-arrow">→</span>}
+                  {!busy && <span className="button-arrow">â†’</span>}
                 </button>
 
                 <p className="privacy-note">
@@ -928,3 +928,4 @@ createRoot(document.getElementById("root")).render(
     <App />
   </React.StrictMode>
 );
+

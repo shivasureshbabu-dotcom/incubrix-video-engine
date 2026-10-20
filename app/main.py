@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 from fastapi.responses import FileResponse
 from app.video_pipeline import run_video_pipeline
 import json
@@ -40,6 +40,7 @@ app.add_middleware(
     allow_origins=[
         "http://127.0.0.1:5173",
         "http://localhost:5173",
+        "https://incubrix-video-engine.vercel.app",
     ],
     allow_credentials=False,
     allow_methods=["*"],
@@ -537,3 +538,5 @@ async def analyze_audio_and_create_scenes(
     finally:
         if saved_path is not None:
             saved_path.unlink(missing_ok=True)
+
+
