@@ -1,4 +1,6 @@
 
+from __future__ import annotations
+
 import os
 import subprocess
 from pathlib import Path
@@ -11,36 +13,75 @@ def render_video(
     output_path: str,
     format_name: str = "landscape",
 ) -> str:
-    """Resize and render a video to a standard MP4 format."""
+    """Resize and encode a video using low-memory FFmpeg settings."""
 
-    source = Path(input_path)
-    destination = Path(output_path)
+    source = Path(input_path).resolve()
+    destination = Path(output_path).resolve()
 
     if not source.is_file():
         raise ValueError("Input video file does not exist")
 
-    if source.resolve() == destination.resolve():
+    if source == destination:
         raise ValueError("Input and output paths must be different")
 
     target = get_target_dimensions(format_name)
 
-    ffmpeg_path = os.getenv("FFMPEG_PATH", "ffmpeg")
+    # Preserve the requested aspect ratio, but cap the output canvas
+    # to dimensions suitable for a low-memory demo.
+    max_dimensions = {
+        "landscape": (854, 480),
+        "portrait": (480, 854),
+        "square": (480, 480),
+    }
+
+    if format_name not in max_dimensions:
+        raise ValueError(
+            "Unsupported video format. Use landscape, portrait, or square."
+        )
+
+    max_width, max_height = max_dimensions[format_name]
+
+    try:
+        target_width = int(target["width"])
+        target_height = int(target["height"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Invalid target video dimensions") from error
+
+    # Do not upscale beyond the low-memory target canvas.
+    width = min(target_width, max_width)
+    height = min(target_height, max_height)
+
+    # H.264 yuv420p requires even dimensions.
+    width -= width % 2
+    height -= height % 2
+
+    if width < 2 or height < 2:
+        raise ValueError("Target dimensions must be at least 2x2")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg_path = os.getenv("FFMPEG_PATH", "ffmpeg")
+
+    video_filter = (
+        f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},"
+        "fps=24"
+    )
 
     command = [
         ffmpeg_path,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
         "-y",
+        "-threads", "1",
         "-i", str(source),
-        "-vf",
-        (
-            f"scale={target['width']}:{target['height']}:"
-            "force_original_aspect_ratio=increase,"
-            f"crop={target['width']}:{target['height']}"
-        ),
+        "-map", "0:v:0",
+        "-vf", video_filter,
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "23",
+        "-preset", "ultrafast",
+        "-threads", "1",
+        "-crf", "30",
+        "-pix_fmt", "yuv420p",
         "-an",
         "-movflags", "+faststart",
         str(destination),
@@ -49,26 +90,40 @@ def render_video(
     try:
         subprocess.run(
             command,
-            capture_output=True,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             check=True,
-            timeout=300,
+            timeout=180,
         )
+
     except FileNotFoundError as error:
-        raise RuntimeError(
-            "FFmpeg was not found. Set the FFMPEG_PATH environment variable."
-        ) from error
-    except subprocess.CalledProcessError as error:
         destination.unlink(missing_ok=True)
         raise RuntimeError(
-            f"FFmpeg rendering failed: {error.stderr[-1000:]}"
+            "FFmpeg was not found. Check the FFMPEG_PATH environment variable."
         ) from error
+
+    except subprocess.CalledProcessError as error:
+        destination.unlink(missing_ok=True)
+
+        details = error.stderr
+        if isinstance(details, bytes):
+            details = details.decode("utf-8", errors="replace")
+
+        details = (details or "")[-1200:]
+
+        raise RuntimeError(
+            "FFmpeg rendering failed: "
+            f"{details or 'No error details available'}"
+        ) from error
+
     except subprocess.TimeoutExpired as error:
         destination.unlink(missing_ok=True)
         raise RuntimeError("Video rendering timed out") from error
 
     if not destination.is_file() or destination.stat().st_size == 0:
         destination.unlink(missing_ok=True)
-        raise RuntimeError("FFmpeg did not produce a valid output file")
+        raise RuntimeError(
+            "FFmpeg did not produce a valid output file"
+        )
 
     return str(destination)
