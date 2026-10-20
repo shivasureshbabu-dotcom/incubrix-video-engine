@@ -1,5 +1,6 @@
 from __future__ import annotations
-
+from fastapi.responses import FileResponse
+from app.video_pipeline import run_video_pipeline
 import json
 import os
 import threading
@@ -10,7 +11,7 @@ import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, Header, HTTPException, UploadFile, File
 from app.audio_analyzer import (
     analyze_audio,
@@ -33,6 +34,16 @@ app = FastAPI(
     title="IncuBrix Script-to-B-Roll Engine",
     version="0.1.0",
     description="Stage 1 backend foundation. Audio analysis, footage ranking, and rendering come in later stages.",
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 _idempotency_lock = threading.Lock()
@@ -82,23 +93,92 @@ def write_job(job: dict[str, Any]) -> None:
 
 
 def run_demo_job(job_id: str) -> None:
-    """Temporary Stage 1 worker; later stages replace this with real processing."""
-    steps = [
-        (10, "accepted", "Job accepted"),
-        (35, "planning", "Preparing scene plan (placeholder)"),
-        (70, "processing", "Audio analysis and footage selection will be added next"),
-        (100, "completed", "Stage 1 demo job completed; no video rendered yet"),
-    ]
-    for progress, status, message in steps:
-        time.sleep(0.5)
+    """Run real video generation and only complete when an MP4 exists."""
+    job = read_job(job_id)
+    if job is None:
+        return
+
+    try:
+        job.update(
+            status="processing",
+            progress=5,
+            message="Starting video generation",
+            updated_at=now_iso(),
+        )
+        write_job(job)
+
+        payload = job.get("input", {})
+
+        def update_progress(percent: int, message: str) -> None:
+            current = read_job(job_id)
+            if current is None:
+                return
+
+            current.update(
+                status="processing",
+                progress=min(99, max(0, percent)),
+                message=message,
+                updated_at=now_iso(),
+            )
+            write_job(current)
+
+        result = run_video_pipeline(
+            script=payload["script"],
+            aspect_ratio=payload.get("aspect_ratio", "16:9"),
+            job_id=job_id,
+            output_dir=OUTPUTS_DIR,
+            progress_callback=update_progress,
+        )
+
+        video_path = Path(result["video_path"]).resolve()
+        output_root = OUTPUTS_DIR.resolve()
+
+        # Never mark the job completed unless the final MP4 exists
+        # inside the configured outputs directory.
+        if (
+            not video_path.is_relative_to(output_root)
+            or video_path.suffix.lower() != ".mp4"
+            or not video_path.is_file()
+            or video_path.stat().st_size == 0
+        ):
+            raise RuntimeError("Video generation did not produce a valid MP4")
+        validation = result.get("validation")
+        if not isinstance(validation, dict) or validation.get("valid") is not True:
+            raise RuntimeError("Generated video failed validation")
         job = read_job(job_id)
         if job is None:
             return
-        job.update(progress=progress, status=status, message=message, updated_at=now_iso())
+
+        job.update(
+            status="completed",
+            progress=100,
+            message="Video generated successfully",
+            result={
+                "video_filename": video_path.name,
+                "video_url": f"/api/v1/jobs/{job_id}/video",
+                "scene_count": result.get("scene_count"),
+                "validation": validation,
+            },
+            error=None,
+            updated_at=now_iso(),
+        )
         write_job(job)
 
+    except Exception as exc:
+        job = read_job(job_id)
+        if job is None:
+            return
 
-@app.get("/")
+        job.update(
+            status="failed",
+            progress=0,
+            message="Video generation failed",
+            error=str(exc),
+            result=None,
+            updated_at=now_iso(),
+        )
+        write_job(job)
+
 def root():
     return {"name": "IncuBrix Script-to-B-Roll Engine", "version": "0.1.0", "stage": 1, "docs": "/docs"}
 
@@ -119,40 +199,60 @@ def ready():
 
 
 @app.post("/api/v1/jobs", status_code=202)
+
+@app.post("/api/v1/jobs", status_code=202)
 def create_job(
     payload: CreateJobRequest,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
-    if idempotency_key:
-        if len(idempotency_key) > 200:
-            raise HTTPException(status_code=400, detail={
-                "code": "INVALID_IDEMPOTENCY_KEY",
-                "message": "Idempotency-Key must be 200 characters or fewer.",
-            })
-        with _idempotency_lock:
+    if idempotency_key is not None:
+        if not idempotency_key.strip() or len(idempotency_key) > 200:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "INVALID_IDEMPOTENCY_KEY",
+                    "message": "Idempotency-Key must be non-empty and 200 characters or fewer.",
+                },
+            )
+
+    job = None
+
+    # Keep lookup, job creation, and key registration atomic.
+    with _idempotency_lock:
+        if idempotency_key is not None:
             old_id = _idempotency.get(idempotency_key)
             old_job = read_job(old_id) if old_id else None
-            if old_job:
+
+            if old_job is not None:
                 return {"job": old_job, "idempotent_replay": True}
 
-    job_id = str(uuid.uuid4())
-    job = {
-        "job_id": job_id,
-        "status": "queued",
-        "progress": 0,
-        "message": "Job queued. Stage 1 runs a placeholder workflow only.",
-        "input": payload.model_dump(),
-        "created_at": now_iso(),
-        "updated_at": now_iso(),
-        "result": None,
-        "error": None,
-    }
-    write_job(job)
-    if idempotency_key:
-        with _idempotency_lock:
+        job_id = str(uuid.uuid4())
+        job = {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "message": "Job queued for video generation.",
+            "input": payload.model_dump(),
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+            "result": None,
+            "error": None,
+        }
+
+        write_job(job)
+
+        if idempotency_key is not None:
             _idempotency[idempotency_key] = job_id
-    threading.Thread(target=run_demo_job, args=(job_id,), daemon=True).start()
+
+    # Start generation outside the lock.
+    threading.Thread(
+        target=run_demo_job,
+        args=(job["job_id"],),
+        daemon=True,
+    ).start()
+
     return {"job": job, "idempotent_replay": False}
+
 
 
 @app.get("/api/v1/jobs/{job_id}")
@@ -163,6 +263,51 @@ def get_job(job_id: str):
             "code": "JOB_NOT_FOUND", "message": f"No job found with id {job_id}."
         })
     return {"job": job}
+
+@app.get("/api/v1/jobs/{job_id}/video")
+def download_generated_video(job_id: str):
+    job = read_job(job_id)
+
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "JOB_NOT_FOUND", "message": "Job not found."},
+        )
+
+    if job.get("status") != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "VIDEO_NOT_READY",
+                "message": "The video is not ready for download.",
+            },
+        )
+
+    filename = (job.get("result") or {}).get("video_filename")
+    if not filename or Path(filename).name != filename:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "VIDEO_NOT_FOUND", "message": "Video not found."},
+        )
+
+    output_root = OUTPUTS_DIR.resolve()
+    video_path = (output_root / filename).resolve()
+
+    if (
+        not video_path.is_relative_to(output_root)
+        or video_path.suffix.lower() != ".mp4"
+        or not video_path.is_file()
+    ):
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "VIDEO_NOT_FOUND", "message": "Video file not found."},
+        )
+
+    return FileResponse(
+        path=str(video_path),
+        media_type="video/mp4",
+        filename=video_path.name,
+    )
 
 
 @app.get("/api/v1/jobs")

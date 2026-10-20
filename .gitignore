@@ -27,3 +27,7 @@ data/uploads/
 # Temporary files
 *.tmp
 *.log
+
+# Frontend dependencies and build output
+Frontend/node_modules/
+Frontend/dist/

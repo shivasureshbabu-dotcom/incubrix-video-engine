@@ -1,144 +1,189 @@
 
 from pathlib import Path
+import math
+import sys
 import wave
+from array import array
 
 
-def analyze_audio(file_path: str) -> dict:
-    """
-    Analyze a WAV audio file and return its duration
-    and detected silence intervals.
-    """
+def _read_wav(file_path: str):
+    """Read a 16-bit PCM WAV file and return its audio data and metadata."""
     path = Path(file_path)
 
-    if not path.exists():
+    if not path.is_file():
         raise FileNotFoundError(f"Audio file not found: {file_path}")
 
     if path.suffix.lower() != ".wav":
         raise ValueError("Currently, only WAV files are supported.")
 
     with wave.open(str(path), "rb") as audio:
-        frame_rate = audio.getframerate()
-        frame_count = audio.getnframes()
         sample_width = audio.getsampwidth()
         channels = audio.getnchannels()
-        frames = audio.readframes(frame_count)
+        frame_rate = audio.getframerate()
+        frame_count = audio.getnframes()
+        raw_audio = audio.readframes(frame_count)
+        compression = audio.getcomptype()
 
-    duration = frame_count / frame_rate
-
-    # This first version supports standard 16-bit PCM WAV files.
     if sample_width != 2:
         raise ValueError("Please use a 16-bit PCM WAV file.")
 
-    silence_threshold = 500
-    min_silence_seconds = 0.5
-    samples_per_frame = channels
+    if compression != "NONE":
+        raise ValueError("Please use an uncompressed PCM WAV file.")
+
+    if channels < 1 or frame_rate < 1:
+        raise ValueError("Invalid WAV audio format.")
+
+    samples = array("h")
+    samples.frombytes(raw_audio)
+
+    if sys.byteorder != "little":
+        samples.byteswap()
+
+    # Each WAV frame contains one sample per channel.
+    frame_count = len(samples) // channels
+    duration = frame_count / frame_rate
+
+    return path, samples, channels, frame_rate, duration
+
+
+def _rms_windows(samples, channels, frame_rate, window_seconds=0.05):
+    """Return (start, end, RMS) for short audio windows."""
+    frames_per_window = max(1, int(frame_rate * window_seconds))
+    samples_per_window = frames_per_window * channels
+    total_frames = len(samples) // channels
+
+    windows = []
+
+    for frame_start in range(0, total_frames, frames_per_window):
+        frame_end = min(frame_start + frames_per_window, total_frames)
+        sample_start = frame_start * channels
+        sample_end = frame_end * channels
+        chunk = samples[sample_start:sample_end]
+
+        if not chunk:
+            continue
+
+        rms = math.sqrt(
+            sum(float(sample) ** 2 for sample in chunk) / len(chunk)
+        )
+
+        windows.append((
+            frame_start / frame_rate,
+            frame_end / frame_rate,
+            rms,
+        ))
+
+    return windows
+
+
+def analyze_audio(file_path: str) -> dict:
+    """
+    Return the WAV duration and detected silence intervals.
+
+    Silence is estimated using 50 ms RMS windows. The threshold adapts
+    to the recording's overall loudness, with a configurable noise floor.
+    """
+    path, samples, channels, frame_rate, duration = _read_wav(file_path)
+
+    if duration <= 0:
+        return {
+            "filename": path.name,
+            "duration_seconds": 0.0,
+            "silence_intervals": [],
+        }
+
+    windows = _rms_windows(samples, channels, frame_rate)
+
+    # RMS values from each window, including quiet portions.
+    rms_values = [rms for _, _, rms in windows]
+
+    # Estimate typical loudness from the louder windows so pauses do not
+    # pull the reference level down too much.
+    louder_values = [
+        rms for rms in rms_values
+        if rms > 0
+    ]
+
+    if not louder_values:
+        return {
+            "filename": path.name,
+            "duration_seconds": round(duration, 2),
+            "silence_intervals": [{
+                "start": 0.0,
+                "end": round(duration, 2),
+            }] if duration >= 0.5 else [],
+        }
+
+    louder_values.sort()
+    reference = louder_values[int(0.70 * (len(louder_values) - 1))]
+
+    # Keep a minimum threshold for low-level digital noise, while adapting
+    # to quiet or loud recordings. Adjust these values if needed.
+    silence_threshold = max(80.0, reference * 0.08)
+    min_silence_seconds = 0.30
+
     silence_intervals = []
     silence_start = None
 
-    for i in range(0, len(frames), sample_width * samples_per_frame):
-        sample_bytes = frames[i:i + sample_width * samples_per_frame]
-        if len(sample_bytes) < sample_width * samples_per_frame:
-            break
-
-        # Find the loudest channel in this audio frame.
-        amplitudes = [
-            abs(int.from_bytes(
-                sample_bytes[j:j + sample_width],
-                byteorder="little",
-                signed=True
-            ))
-            for j in range(0, len(sample_bytes), sample_width)
-        ]
-
-        is_silent = max(amplitudes, default=0) < silence_threshold
-        timestamp = i / (sample_width * samples_per_frame * frame_rate)
+    for start, end, rms in windows:
+        is_silent = rms < silence_threshold
 
         if is_silent and silence_start is None:
-            silence_start = timestamp
+            silence_start = start
+
         elif not is_silent and silence_start is not None:
-            if timestamp - silence_start >= min_silence_seconds:
+            if start - silence_start >= min_silence_seconds:
                 silence_intervals.append({
                     "start": round(silence_start, 2),
-                    "end": round(timestamp, 2)
+                    "end": round(start, 2),
                 })
             silence_start = None
 
+    # Include silence that continues through the end of the recording.
     if silence_start is not None:
         if duration - silence_start >= min_silence_seconds:
             silence_intervals.append({
                 "start": round(silence_start, 2),
-                "end": round(duration, 2)
+                "end": round(duration, 2),
             })
 
     return {
         "filename": path.name,
         "duration_seconds": round(duration, 2),
-        "silence_intervals": silence_intervals
+        "silence_intervals": silence_intervals,
     }
 
 
-
 def detect_emphasis(file_path: str) -> dict:
-    """Detect sections that are noticeably louder than the surrounding audio."""
-    from array import array
-    from pathlib import Path
-    import math
-    import wave
+    """Detect audio windows that are louder than the recording's baseline."""
+    path, samples, channels, frame_rate, _ = _read_wav(file_path)
 
-    path = Path(file_path)
+    # Quarter-second windows make the results easier to interpret.
+    windows = _rms_windows(
+        samples,
+        channels,
+        frame_rate,
+        window_seconds=0.25,
+    )
 
-    if not path.exists():
-        raise FileNotFoundError(f"Audio file not found: {file_path}")
+    non_silent = [
+        rms for _, _, rms in windows
+        if rms > 80
+    ]
 
-    if path.suffix.lower() != ".wav":
-        raise ValueError("Currently, only WAV files are supported.")
-
-    with wave.open(str(path), "rb") as audio:
-        sample_width = audio.getsampwidth()
-        channels = audio.getnchannels()
-        frame_rate = audio.getframerate()
-        raw_audio = audio.readframes(audio.getnframes())
-
-    if sample_width != 2:
-        raise ValueError("Please use a 16-bit PCM WAV file.")
-
-    samples = array("h")
-    samples.frombytes(raw_audio)
-
-    # WAV audio is little-endian; convert if this computer uses big-endian.
-    if samples.itemsize != 2:
-        raise ValueError("Unsupported audio sample format.")
-
-    if __import__("sys").byteorder != "little":
-        samples.byteswap()
-
-    frame_size = channels
-    samples_per_window = max(frame_rate // 4, 1) * frame_size
-    windows = []
-
-    for start in range(0, len(samples), samples_per_window):
-        chunk = samples[start:start + samples_per_window]
-        if not chunk:
-            continue
-
-        rms = math.sqrt(sum(float(s) * s for s in chunk) / len(chunk))
-        time_start = start / (frame_rate * frame_size)
-        time_end = min(
-            (start + len(chunk)) / (frame_rate * frame_size),
-            len(samples) / (frame_rate * frame_size),
-        )
-        windows.append((time_start, time_end, rms))
-
-    non_silent = [rms for _, _, rms in windows if rms > 500]
     if not non_silent:
         return {"emphasis_intervals": []}
 
-    average = sum(non_silent) / len(non_silent)
-    threshold = max(average * 1.5, 1000)
+    non_silent.sort()
+    baseline = non_silent[len(non_silent) // 2]
+
+    # A window must be clearly louder than typical speech to count.
+    threshold = max(500.0, baseline * 1.5)
 
     emphasis_intervals = []
+
     for start, end, rms in windows:
-        if rms >= threshold:
+        if rms >= threshold and rms > baseline * 1.5:
             emphasis_intervals.append({
                 "start": round(start, 2),
                 "end": round(end, 2),
@@ -148,24 +193,17 @@ def detect_emphasis(file_path: str) -> dict:
     return {"emphasis_intervals": emphasis_intervals}
 
 
-
-
-
-
 def create_scene_timing(
     duration_seconds: float,
     silence_intervals: list[dict],
     emphasis_intervals: list[dict],
 ) -> dict:
     """Create scene boundaries using silence and emphasis timestamps."""
-
     if duration_seconds <= 0:
         raise ValueError("Duration must be greater than zero.")
 
-    # Start with the beginning and end of the audio.
     boundaries = {0.0, float(duration_seconds)}
 
-    # Add boundaries around detected silence intervals.
     for interval in silence_intervals:
         start = float(interval["start"])
         end = float(interval["end"])
@@ -176,23 +214,16 @@ def create_scene_timing(
         if 0 < end < duration_seconds:
             boundaries.add(end)
 
-    # Add boundaries where louder audio sections begin.
     for interval in emphasis_intervals:
         start = float(interval["start"])
 
         if 0 < start < duration_seconds:
             boundaries.add(start)
 
-    # Sort the boundaries from beginning to end.
     sorted_boundaries = sorted(boundaries)
-
-    # Build one scene between each pair of boundaries.
     scenes = []
 
-    for start, end in zip(
-        sorted_boundaries,
-        sorted_boundaries[1:],
-    ):
+    for start, end in zip(sorted_boundaries, sorted_boundaries[1:]):
         if end <= start:
             continue
 
